@@ -42,14 +42,3 @@ jobs:
 
     - name: Push image for github container repository with latest
       run: 'docker push $REGISTRY:latest'
-
-    - name: Setup python
-      uses: actions/setup-python@v2
-      with:
-        python-version: 3.x
-
-    - name: Install mkdocs
-      run: pip install mkdocs-material
-
-    - name: Publish mkdocs
-      run: mkdocs gh-deploy --force

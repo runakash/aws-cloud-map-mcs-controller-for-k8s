@@ -8,5 +8,5 @@ theme:
   name: material
   language: en
   favicon: images/cloudmap.svg
-
+  logo: images/cloudmap.svg
 
