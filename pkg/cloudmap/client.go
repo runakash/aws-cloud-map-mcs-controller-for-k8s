@@ -8,6 +8,7 @@ import (
 	"github.com/aws/aws-cloud-map-mcs-controller-for-k8s/pkg/common"
 	"github.com/aws/aws-cloud-map-mcs-controller-for-k8s/pkg/model"
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/servicediscovery/types"
 )
 
 // ServiceDiscoveryClient provides the service endpoint management functionality required by the AWS Cloud Map
@@ -40,7 +41,7 @@ type serviceDiscoveryClient struct {
 // from a given AWS client config.
 func NewDefaultServiceDiscoveryClient(cfg *aws.Config, clusterUtils model.ClusterUtils) ServiceDiscoveryClient {
 	return &serviceDiscoveryClient{
-		log:          common.NewLogger("cloudmap"),
+		log:          common.NewLogger("cloudmap", "client"),
 		sdApi:        NewServiceDiscoveryApiFromConfig(cfg),
 		cache:        NewDefaultServiceDiscoveryClientCache(),
 		clusterUtils: clusterUtils,
@@ -49,7 +50,7 @@ func NewDefaultServiceDiscoveryClient(cfg *aws.Config, clusterUtils model.Cluste
 
 func NewServiceDiscoveryClientWithCustomCache(cfg *aws.Config, cacheConfig *SdCacheConfig, clusterUtils model.ClusterUtils) ServiceDiscoveryClient {
 	return &serviceDiscoveryClient{
-		log:          common.NewLogger("cloudmap"),
+		log:          common.NewLogger("cloudmap", "client"),
 		sdApi:        NewServiceDiscoveryApiFromConfig(cfg),
 		cache:        NewServiceDiscoveryClientCache(cacheConfig),
 		clusterUtils: clusterUtils,
@@ -59,6 +60,10 @@ func NewServiceDiscoveryClientWithCustomCache(cfg *aws.Config, cacheConfig *SdCa
 func (sdc *serviceDiscoveryClient) ListServices(ctx context.Context, nsName string) (svcs []*model.Service, err error) {
 	svcIdMap, err := sdc.getServiceIds(ctx, nsName)
 	if err != nil {
+		// Ignore resource not found error, as it will indicate deleted resources in CloudMap
+		if common.IsNotFound(err) {
+			return svcs, nil
+		}
 		return svcs, err
 	}
 
@@ -81,13 +86,13 @@ func (sdc *serviceDiscoveryClient) ListServices(ctx context.Context, nsName stri
 func (sdc *serviceDiscoveryClient) CreateService(ctx context.Context, nsName string, svcName string) error {
 	sdc.log.Info("creating a new service", "namespace", nsName, "name", svcName)
 
-	nsMap, err := sdc.getNamespaces(ctx)
-	if err != nil {
+	namespace, err := sdc.getNamespace(ctx, nsName)
+	if common.IsUnknown(err) {
 		return err
 	}
 
-	namespace := nsMap[nsName]
-	if namespace == nil {
+	if common.IsNotFound(err) {
+		sdc.log.Info("namespace not found for service", "namespace", nsName, "service", svcName)
 		// Create HttpNamespace if the namespace is not present in CloudMap
 		namespace, err = sdc.createNamespace(ctx, nsName)
 		if err != nil {
@@ -107,9 +112,7 @@ func (sdc *serviceDiscoveryClient) CreateService(ctx context.Context, nsName str
 
 func (sdc *serviceDiscoveryClient) GetService(ctx context.Context, nsName string, svcName string) (svc *model.Service, err error) {
 	sdc.log.Info("fetching a service", "namespace", nsName, "name", svcName)
-	endpts, cacheHit := sdc.cache.GetEndpoints(nsName, svcName)
-
-	if cacheHit {
+	if endpts, found := sdc.cache.GetEndpoints(nsName, svcName); found {
 		return &model.Service{
 			Namespace: nsName,
 			Name:      svcName,
@@ -117,17 +120,12 @@ func (sdc *serviceDiscoveryClient) GetService(ctx context.Context, nsName string
 		}, nil
 	}
 
-	svcIdMap, err := sdc.getServiceIds(ctx, nsName)
+	_, err = sdc.getServiceId(ctx, nsName, svcName)
 	if err != nil {
 		return nil, err
 	}
-	_, found := svcIdMap[svcName]
-	if !found {
-		return nil, nil
-	}
 
-	endpts, err = sdc.getEndpoints(ctx, nsName, svcName)
-
+	endpts, err := sdc.getEndpoints(ctx, nsName, svcName)
 	if err != nil {
 		return nil, err
 	}
@@ -147,36 +145,27 @@ func (sdc *serviceDiscoveryClient) RegisterEndpoints(ctx context.Context, nsName
 
 	sdc.log.Info("registering endpoints", "namespaceName", nsName, "serviceName", svcName, "endpoints", endpts)
 
-	svcIdMap, err := sdc.getServiceIds(ctx, nsName)
+	svcId, err := sdc.getServiceId(ctx, nsName, svcName)
 	if err != nil {
 		return err
 	}
-	svcId, found := svcIdMap[svcName]
-	if !found {
-		return fmt.Errorf("service not found in Cloud Map: %s", svcName)
-	}
 
-	opCollector := NewOperationCollector()
-
+	operationPoller := NewOperationPoller(sdc.sdApi)
 	for _, endpt := range endpts {
-		endptId := endpt.Id
 		endptAttrs := endpt.GetCloudMapAttributes()
-		opCollector.Add(func() (opId string, err error) {
-			return sdc.sdApi.RegisterInstance(ctx, svcId, endptId, endptAttrs)
-		})
+		opId, endptErr := sdc.sdApi.RegisterInstance(ctx, svcId, endpt.Id, endptAttrs)
+		if endptErr != nil {
+			err = common.Wrap(err, endptErr)
+		}
+		operationPoller.Submit(ctx, opId)
 	}
-
-	err = NewRegisterInstancePoller(sdc.sdApi, svcId, opCollector.Collect(), opCollector.GetStartTime()).Poll(ctx)
 
 	// Evict cache entry so next list call reflects changes
 	sdc.cache.EvictEndpoints(nsName, svcName)
 
+	err = operationPoller.Await()
 	if err != nil {
-		return err
-	}
-
-	if !opCollector.IsAllOperationsCreated() {
-		return errors.New("failure while registering endpoints")
+		return common.Wrap(err, errors.New("failure while registering endpoints"))
 	}
 
 	return nil
@@ -190,43 +179,34 @@ func (sdc *serviceDiscoveryClient) DeleteEndpoints(ctx context.Context, nsName s
 
 	sdc.log.Info("deleting endpoints", "namespaceName", nsName, "serviceName", svcName, "endpoints", endpts)
 
-	svcIdMap, err := sdc.getServiceIds(ctx, nsName)
+	svcId, err := sdc.getServiceId(ctx, nsName, svcName)
 	if err != nil {
 		return err
 	}
-	svcId, found := svcIdMap[svcName]
-	if !found {
-		return fmt.Errorf("service not found in Cloud Map: %s", svcName)
-	}
 
-	opCollector := NewOperationCollector()
-
+	operationPoller := NewOperationPoller(sdc.sdApi)
 	for _, endpt := range endpts {
-		endptId := endpt.Id
-		// add operation to delete endpoint
-		opCollector.Add(func() (opId string, err error) {
-			return sdc.sdApi.DeregisterInstance(ctx, svcId, endptId)
-		})
+		opId, endptErr := sdc.sdApi.DeregisterInstance(ctx, svcId, endpt.Id)
+		if endptErr != nil {
+			err = common.Wrap(err, endptErr)
+		}
+		operationPoller.Submit(ctx, opId)
 	}
-
-	err = NewDeregisterInstancePoller(sdc.sdApi, svcId, opCollector.Collect(), opCollector.GetStartTime()).Poll(ctx)
 
 	// Evict cache entry so next list call reflects changes
 	sdc.cache.EvictEndpoints(nsName, svcName)
+
+	err = operationPoller.Await()
 	if err != nil {
-		return err
+		return common.Wrap(err, errors.New("failure while de-registering endpoints"))
 	}
 
-	if !opCollector.IsAllOperationsCreated() {
-		return errors.New("failure while de-registering endpoints")
-	}
-
-	return nil
+	return err
 }
 
 func (sdc *serviceDiscoveryClient) getEndpoints(ctx context.Context, nsName string, svcName string) (endpts []*model.Endpoint, err error) {
-	endpts, cacheHit := sdc.cache.GetEndpoints(nsName, svcName)
-	if cacheHit {
+	endpts, found := sdc.cache.GetEndpoints(nsName, svcName)
+	if found {
 		return endpts, nil
 	}
 
@@ -239,7 +219,7 @@ func (sdc *serviceDiscoveryClient) getEndpoints(ctx context.Context, nsName stri
 	queryParameters := map[string]string{
 		model.ClusterSetIdAttr: clusterProperties.ClusterSetId(),
 	}
-	insts, err := sdc.sdApi.DiscoverInstances(ctx, nsName, svcName, &queryParameters)
+	insts, err := sdc.sdApi.DiscoverInstances(ctx, nsName, svcName, queryParameters)
 	if err != nil {
 		return nil, err
 	}
@@ -257,10 +237,23 @@ func (sdc *serviceDiscoveryClient) getEndpoints(ctx context.Context, nsName stri
 	return endpts, nil
 }
 
-func (sdc *serviceDiscoveryClient) getNamespaces(ctx context.Context) (namespace map[string]*model.Namespace, err error) {
+func (sdc *serviceDiscoveryClient) getNamespace(ctx context.Context, nsName string) (namespace *model.Namespace, err error) {
+	namespaces, err := sdc.getNamespaces(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	if namespace, ok := namespaces[nsName]; ok {
+		return namespace, nil
+	}
+
+	return nil, common.NotFoundError(fmt.Sprintf("namespace: %s", nsName))
+}
+
+func (sdc *serviceDiscoveryClient) getNamespaces(ctx context.Context) (namespaces map[string]*model.Namespace, err error) {
 	// We are assuming a unique namespace name per account
-	namespaces, cacheHit := sdc.cache.GetNamespaceMap()
-	if cacheHit {
+	namespaces, found := sdc.cache.GetNamespaceMap()
+	if found {
 		return namespaces, nil
 	}
 
@@ -273,15 +266,27 @@ func (sdc *serviceDiscoveryClient) getNamespaces(ctx context.Context) (namespace
 	return namespaces, nil
 }
 
+func (sdc *serviceDiscoveryClient) getServiceId(ctx context.Context, nsName string, svcName string) (svcId string, err error) {
+	svcIdMap, err := sdc.getServiceIds(ctx, nsName)
+	if err != nil {
+		return "", err
+	}
+
+	if svcId, ok := svcIdMap[svcName]; ok {
+		return svcId, nil
+	}
+
+	return "", common.NotFoundError(fmt.Sprintf("service: %s", svcName))
+}
+
 func (sdc *serviceDiscoveryClient) getServiceIds(ctx context.Context, nsName string) (map[string]string, error) {
-	serviceIdMap, cacheHit := sdc.cache.GetServiceIdMap(nsName)
-	if cacheHit {
+	serviceIdMap, found := sdc.cache.GetServiceIdMap(nsName)
+	if found {
 		return serviceIdMap, nil
 	}
 
-	nsMap, err := sdc.getNamespaces(ctx)
-	namespace := nsMap[nsName]
-	if err != nil || namespace == nil {
+	namespace, err := sdc.getNamespace(ctx, nsName)
+	if err != nil {
 		return nil, err
 	}
 
@@ -301,12 +306,13 @@ func (sdc *serviceDiscoveryClient) createNamespace(ctx context.Context, nsName s
 		return nil, err
 	}
 
-	nsId, err := sdc.sdApi.PollNamespaceOperation(ctx, opId)
+	op, err := NewOperationPoller(sdc.sdApi).Poll(ctx, opId)
 	if err != nil {
 		return nil, err
 	}
+	nsId := op.Targets[string(types.OperationTargetTypeNamespace)]
 
-	sdc.log.Info("namespace created", "nsId", nsId)
+	sdc.log.Info("namespace created", "nsId", nsId, "namespace", nsName)
 
 	// Default namespace type HTTP
 	namespace = &model.Namespace{

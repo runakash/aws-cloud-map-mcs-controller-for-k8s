@@ -2,8 +2,6 @@ package cloudmap
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -13,7 +11,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	sd "github.com/aws/aws-sdk-go-v2/service/servicediscovery"
 	"github.com/aws/aws-sdk-go-v2/service/servicediscovery/types"
-	"k8s.io/apimachinery/pkg/util/wait"
 )
 
 const (
@@ -30,10 +27,7 @@ type ServiceDiscoveryApi interface {
 	GetServiceIdMap(ctx context.Context, namespaceId string) (serviceIdMap map[string]string, err error)
 
 	// DiscoverInstances returns a list of service instances registered to a given service.
-	DiscoverInstances(ctx context.Context, nsName string, svcName string, queryParameters *map[string]string) (insts []types.HttpInstanceSummary, err error)
-
-	// ListOperations returns a map of operations to their status matching a list of filters.
-	ListOperations(ctx context.Context, opFilters []types.OperationFilter) (operationStatusMap map[string]types.OperationStatus, err error)
+	DiscoverInstances(ctx context.Context, nsName string, svcName string, queryParameters map[string]string) (insts []types.HttpInstanceSummary, err error)
 
 	// GetOperation returns an operation.
 	GetOperation(ctx context.Context, operationId string) (operation *types.Operation, err error)
@@ -49,9 +43,6 @@ type ServiceDiscoveryApi interface {
 
 	// DeregisterInstance de-registers a service instance in Cloud Map.
 	DeregisterInstance(ctx context.Context, serviceId string, instanceId string) (operationId string, err error)
-
-	// PollNamespaceOperation polls a namespace operation, and returns the namespace ID.
-	PollNamespaceOperation(ctx context.Context, operationId string) (namespaceId string, err error)
 }
 
 type serviceDiscoveryApi struct {
@@ -132,7 +123,7 @@ func (sdApi *serviceDiscoveryApi) GetServiceIdMap(ctx context.Context, nsId stri
 	return serviceIdMap, nil
 }
 
-func (sdApi *serviceDiscoveryApi) DiscoverInstances(ctx context.Context, nsName string, svcName string, queryParameters *map[string]string) (insts []types.HttpInstanceSummary, err error) {
+func (sdApi *serviceDiscoveryApi) DiscoverInstances(ctx context.Context, nsName string, svcName string, queryParameters map[string]string) (insts []types.HttpInstanceSummary, err error) {
 	input := &sd.DiscoverInstancesInput{
 		NamespaceName: aws.String(nsName),
 		ServiceName:   aws.String(svcName),
@@ -140,7 +131,7 @@ func (sdApi *serviceDiscoveryApi) DiscoverInstances(ctx context.Context, nsName 
 		MaxResults:    aws.Int32(1000),
 	}
 	if queryParameters != nil {
-		input.QueryParameters = *queryParameters
+		input.QueryParameters = queryParameters
 	}
 	out, err := sdApi.awsFacade.DiscoverInstances(ctx, input)
 
@@ -149,28 +140,6 @@ func (sdApi *serviceDiscoveryApi) DiscoverInstances(ctx context.Context, nsName 
 	}
 
 	return out.Instances, nil
-}
-
-func (sdApi *serviceDiscoveryApi) ListOperations(ctx context.Context, opFilters []types.OperationFilter) (map[string]types.OperationStatus, error) {
-	opStatusMap := make(map[string]types.OperationStatus)
-
-	pages := sd.NewListOperationsPaginator(sdApi.awsFacade, &sd.ListOperationsInput{
-		Filters: opFilters,
-	})
-
-	for pages.HasMorePages() {
-		output, err := pages.NextPage(ctx)
-
-		if err != nil {
-			return opStatusMap, err
-		}
-
-		for _, sdOp := range output.Operations {
-			opStatusMap[aws.ToString(sdOp.Id)] = sdOp.Status
-		}
-	}
-
-	return opStatusMap, nil
 }
 
 func (sdApi *serviceDiscoveryApi) GetOperation(ctx context.Context, opId string) (operation *types.Operation, err error) {
@@ -260,32 +229,4 @@ func (sdApi *serviceDiscoveryApi) DeregisterInstance(ctx context.Context, svcId 
 	}
 
 	return aws.ToString(deregResp.OperationId), err
-}
-
-func (sdApi *serviceDiscoveryApi) PollNamespaceOperation(ctx context.Context, opId string) (nsId string, err error) {
-	err = wait.Poll(defaultOperationPollInterval, defaultOperationPollTimeout, func() (done bool, err error) {
-		sdApi.log.Info("polling operation", "opId", opId)
-		op, err := sdApi.GetOperation(ctx, opId)
-
-		if err != nil {
-			return true, err
-		}
-
-		if op.Status == types.OperationStatusFail {
-			return true, fmt.Errorf("failed to create namespace: %s", aws.ToString(op.ErrorMessage))
-		}
-
-		if op.Status == types.OperationStatusSuccess {
-			nsId = op.Targets[string(types.OperationTargetTypeNamespace)]
-			return true, nil
-		}
-
-		return false, nil
-	})
-
-	if err == wait.ErrWaitTimeout {
-		err = errors.New(operationPollTimoutErrorMessage)
-	}
-
-	return nsId, err
 }

@@ -124,31 +124,11 @@ func TestServiceDiscoveryApi_DiscoverInstances_HappyCase(t *testing.T) {
 			},
 		}, nil)
 
-	insts, err := sdApi.DiscoverInstances(context.TODO(), test.HttpNsName, test.SvcName, &map[string]string{model.ClusterSetIdAttr: test.ClusterSet})
+	insts, err := sdApi.DiscoverInstances(context.TODO(), test.HttpNsName, test.SvcName, map[string]string{model.ClusterSetIdAttr: test.ClusterSet})
 	assert.Nil(t, err, "No error for happy case")
 	assert.True(t, len(insts) == 2)
 	assert.Equal(t, test.EndptId1, *insts[0].InstanceId)
 	assert.Equal(t, test.EndptId2, *insts[1].InstanceId)
-}
-
-func TestServiceDiscoveryApi_ListOperations_HappyCase(t *testing.T) {
-	mockController := gomock.NewController(t)
-	defer mockController.Finish()
-
-	awsFacade := cloudmapMock.NewMockAwsFacade(mockController)
-	sdApi := getServiceDiscoveryApi(t, awsFacade)
-
-	filters := make([]types.OperationFilter, 0)
-	awsFacade.EXPECT().ListOperations(context.TODO(), &sd.ListOperationsInput{Filters: filters}).
-		Return(&sd.ListOperationsOutput{
-			Operations: []types.OperationSummary{
-				{Id: aws.String(test.OpId1), Status: types.OperationStatusSuccess},
-			}}, nil)
-
-	ops, err := sdApi.ListOperations(context.TODO(), filters)
-	assert.Nil(t, err, "No error for happy case")
-	assert.True(t, len(ops) == 1)
-	assert.Equal(t, ops[test.OpId1], types.OperationStatusSuccess)
 }
 
 func TestServiceDiscoveryApi_GetOperation_HappyCase(t *testing.T) {
@@ -314,25 +294,6 @@ func TestServiceDiscoveryApi_DeregisterInstance_Error(t *testing.T) {
 	sdApi := getServiceDiscoveryApi(t, awsFacade)
 	_, err := sdApi.DeregisterInstance(context.TODO(), test.SvcId, test.EndptId1)
 	assert.Equal(t, sdkErr, err)
-}
-
-func TestServiceDiscoveryApi_PollNamespaceOperation_HappyCase(t *testing.T) {
-	mockController := gomock.NewController(t)
-	defer mockController.Finish()
-
-	awsFacade := cloudmapMock.NewMockAwsFacade(mockController)
-	awsFacade.EXPECT().GetOperation(context.TODO(), &sd.GetOperationInput{OperationId: aws.String(test.OpId1)}).
-		Return(&sd.GetOperationOutput{Operation: &types.Operation{Status: types.OperationStatusPending}}, nil)
-
-	awsFacade.EXPECT().GetOperation(context.TODO(), &sd.GetOperationInput{OperationId: aws.String(test.OpId1)}).
-		Return(&sd.GetOperationOutput{Operation: &types.Operation{Status: types.OperationStatusSuccess,
-			Targets: map[string]string{string(types.OperationTargetTypeNamespace): test.HttpNsId}}}, nil)
-
-	sdApi := getServiceDiscoveryApi(t, awsFacade)
-
-	nsId, err := sdApi.PollNamespaceOperation(context.TODO(), test.OpId1)
-	assert.Nil(t, err)
-	assert.Equal(t, test.HttpNsId, nsId)
 }
 
 func getServiceDiscoveryApi(t *testing.T, awsFacade *cloudmapMock.MockAwsFacade) ServiceDiscoveryApi {
